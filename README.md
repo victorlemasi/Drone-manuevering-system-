@@ -29,3 +29,29 @@ To use the system, you can:
 2. Adjust PID gains for different control responses
 3. Modify physical parameters for different drone types
 4. Visualize the resulting trajectory in 3D
+ sensors
+1. IMU (Inertial Measurement Unit):
+   - 3-axis accelerometer and gyroscope
+   - Realistic noise modeling including random walk and bias instability
+   - Proper coordinate frame transformations
+
+2. GPS:
+   - Position and velocity measurements
+   - Variable update rate and signal strength
+   - Noise scaled by signal quality
+
+3. Barometer:
+   - Pressure and temperature measurements
+   - Altitude calculation using barometric formula
+   - Temperature-dependent noise modeling
+
+4. Camera:
+   - Obstacle detection with perspective projection
+   - Field of view and resolution parameters
+   - Pixel noise in detections
+
+Common features for all sensors:
+- Random failure simulation
+- Realistic noise models using Gaussian, random walk, and bias components
+- Status reporting
+- Update rate limitations where applicable
