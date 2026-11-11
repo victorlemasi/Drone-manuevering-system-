@@ -1,5 +1,5 @@
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from typing import List, Tuple, Optional
@@ -20,7 +20,7 @@ class DroneState:
     orientation: np.ndarray  # [roll, pitch, yaw]
     angular_velocity: np.ndarray  # [wx, wy, wz]
     battery_level: float = 100.0  # Battery percentage
-    motor_speeds: np.ndarray = np.zeros(4)  # Individual motor speeds
+    motor_speeds: np.ndarray = field(default_factory=lambda: np.zeros(4))  # Individual motor speeds
 
 class DronePhysics:
     def __init__(self):
@@ -42,7 +42,7 @@ class DronePhysics:
         # Battery parameters
         self.battery_capacity = 5000  # mAh
         self.battery_voltage = 11.1  # V
-        self.power_consumption_coefficient = 0.01
+        self.power_consumption_coefficient = 1e-7
 
     def update_state(self, state: DroneState, motor_speeds: np.ndarray) -> DroneState:
         # Calculate thrust and torques from motor speeds
@@ -240,6 +240,16 @@ class DroneController:
         # Obstacle avoidance parameters
         self.obstacle_influence_radius = 2.0
         self.obstacle_repulsion_gain = 1.0
+        
+        # Mixer matrix mapping [total_thrust, roll_torque, pitch_torque, yaw_torque] to motor forces
+        d = 0.2    # motor distance (m)
+        cy = 0.01  # torque to thrust ratio (1e-7 / 1e-5)
+        self.mixer_matrix = np.array([
+            [0.25, 0.0, 0.5 / d, 0.25 / cy],
+            [0.25, 0.5 / d, 0.0, -0.25 / cy],
+            [0.25, 0.0, -0.5 / d, 0.25 / cy],
+            [0.25, -0.5 / d, 0.0, -0.25 / cy]
+        ])
 
     def compute_control(self, current_state: DroneState, target_position: np.ndarray,
                        target_yaw: float, dt: float, obstacles: List[Obstacle]) -> np.ndarray:
@@ -255,22 +265,25 @@ class DroneController:
         pos_error = modified_target - current_state.position
         self.pos_integral += pos_error * dt
         self.pos_integral = np.clip(self.pos_integral, -self.integral_limit, self.integral_limit)
-        
-        pos_derivative = (pos_error - self.prev_pos_error) / dt
-        self.prev_pos_error = pos_error
+        pos_derivative = -current_state.velocity
         
         desired_acceleration = (
             self.kp_pos * pos_error +
             self.ki_pos * self.pos_integral +
             self.kd_pos * pos_derivative
         )
+        desired_acceleration[2] += 9.81  # Feedforward gravity compensation
         
-        # Convert to thrust and attitude
-        thrust_direction = desired_acceleration / (np.linalg.norm(desired_acceleration) + 1e-6)
+        # Transform desired acceleration to drone body frame for attitude calculation
+        yaw = current_state.orientation[2]
+        c_y, s_y = np.cos(yaw), np.sin(yaw)
+        ax_b = c_y * desired_acceleration[0] + s_y * desired_acceleration[1]
+        ay_b = -s_y * desired_acceleration[0] + c_y * desired_acceleration[1]
+        az_b = desired_acceleration[2]
         
-        desired_roll = np.clip(np.arcsin(thrust_direction[1]), -self.max_tilt, self.max_tilt)
-        desired_pitch = np.clip(-np.arctan2(thrust_direction[0], thrust_direction[2]),
-                              -self.max_tilt, self.max_tilt)
+        # Tilt angles in body frame
+        desired_pitch = np.clip(np.arctan2(ax_b, az_b), -self.max_tilt, self.max_tilt)
+        desired_roll = np.clip(-np.arctan2(ay_b, az_b), -self.max_tilt, self.max_tilt)
         desired_yaw = target_yaw
         
         desired_orientation = np.array([desired_roll, desired_pitch, desired_yaw])
@@ -281,9 +294,7 @@ class DroneController:
         
         self.att_integral += att_error * dt
         self.att_integral = np.clip(self.att_integral, -self.integral_limit, self.integral_limit)
-        
-        att_derivative = (att_error - self.prev_att_error) / dt
-        self.prev_att_error = att_error
+        att_derivative = -current_state.angular_velocity
         
         torques = (
             self.kp_att * att_error +
@@ -291,10 +302,8 @@ class DroneController:
             self.kd_att * att_derivative
         )
         
-        return self._compute_motor_speeds(
-            np.linalg.norm(desired_acceleration) * 1.5,
-            torques
-        )
+        thrust_magnitude = np.linalg.norm(desired_acceleration) * 1.5
+        return self._compute_motor_speeds(thrust_magnitude, torques)
 
     def _compute_obstacle_avoidance(self, position: np.ndarray, obstacles: List[Obstacle]) -> np.ndarray:
         total_force = np.zeros(3)
@@ -314,16 +323,10 @@ class DroneController:
         return total_force
 
     def _compute_motor_speeds(self, thrust: float, torques: np.ndarray) -> np.ndarray:
-        mixer_matrix = np.array([
-            [1, -1, -1, 1],
-            [1, 1, 1, 1],
-            [1, 1, -1, -1],
-            [1, -1, 1, -1]
-        ]) * 0.25
-        
         control_vector = np.array([thrust, torques[0], torques[1], torques[2]])
-        motor_speeds = mixer_matrix @ control_vector
-        motor_speeds = np.sqrt(np.maximum(0, motor_speeds))
+        motor_forces = self.mixer_matrix @ control_vector
+        motor_forces = np.clip(motor_forces, 0, 30.0 / 4)
+        motor_speeds = np.sqrt(motor_forces / 1e-5)
         return np.clip(motor_speeds, 0, 2000)
 
 class DroneSimulation:
@@ -339,3 +342,97 @@ class DroneSimulation:
         # Create obstacles
         self.obstacles = [
             Obstacle(np.array([3.0, 3.0, 2.0]), 1.0),
+            Obstacle(np.array([-2.0, 4.0, 3.0]), 0.8),
+            Obstacle(np.array([0.0, -3.0, 4.0]), 1.2)
+        ]
+        
+        # Initialize drone state
+        self.state = DroneState(
+            position=np.zeros(3),
+            velocity=np.zeros(3),
+            orientation=np.zeros(3),
+            angular_velocity=np.zeros(3),
+            battery_level=100.0,
+            motor_speeds=np.zeros(4)
+        )
+
+    def run_simulation(self, waypoints: List[np.ndarray], simulation_time: float):
+        num_steps = int(simulation_time / self.physics.dt)
+        current_waypoint_idx = 0
+        
+        for _ in range(num_steps):
+            # Store state history
+            self.state_history.append([
+                self.state.position.copy(),
+                self.state.orientation.copy()
+            ])
+            self.battery_history.append(self.state.battery_level)
+            
+            # Check waypoint reached
+            distance_to_waypoint = np.linalg.norm(
+                self.state.position - waypoints[current_waypoint_idx][:3])
+            if distance_to_waypoint < 0.6 and current_waypoint_idx < len(waypoints) - 1:
+                current_waypoint_idx += 1
+                print(f"Reached waypoint {current_waypoint_idx-1} -> Target waypoint {current_waypoint_idx}")
+            
+            # Compute control inputs
+            target_position = waypoints[current_waypoint_idx][:3]
+            target_yaw = waypoints[current_waypoint_idx][3]
+            motor_speeds = self.controller.compute_control(
+                self.state, target_position, target_yaw, self.physics.dt, self.obstacles
+            )
+            
+            # Update state with physics
+            self.state = self.physics.update_state(self.state, motor_speeds)
+            
+            if self.state.battery_level <= 0.0:
+                print("Battery depleted!")
+                break
+
+    def visualize_trajectory(self):
+        history = np.array(self.state_history)
+        positions = np.array([state[0] for state in history])
+        
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        # Plot trajectory
+        ax.plot(positions[:, 0], positions[:, 1], positions[:, 2], 'b-', label='Trajectory')
+        
+        # Plot obstacles
+        for obs in self.obstacles:
+            u, v = np.mgrid[0:2*np.pi:20j, 0:np.pi:10j]
+            x = obs.position[0] + obs.radius * np.cos(u) * np.sin(v)
+            y = obs.position[1] + obs.radius * np.sin(u) * np.sin(v)
+            z = obs.position[2] + obs.radius * np.cos(v)
+            ax.plot_wireframe(x, y, z, color='r', alpha=0.3)
+        
+        # Plot start and end points
+        ax.scatter(positions[0, 0], positions[0, 1], positions[0, 2],
+                   color='g', marker='o', s=100, label='Start')
+        ax.scatter(positions[-1, 0], positions[-1, 1], positions[-1, 2],
+                   color='r', marker='o', s=100, label='End')
+        
+        ax.set_xlabel('X (m)')
+        ax.set_ylabel('Y (m)')
+        ax.set_zlabel('Z (m)')
+        ax.set_title('Drone Trajectory with Obstacle Avoidance')
+        ax.legend()
+        plt.show()
+
+if __name__ == "__main__":
+    # Create waypoints [x, y, z, yaw]
+    waypoints = [
+        np.array([0., 0., 2., 0.]),        # Takeoff
+        np.array([5., 0., 2., 0.]),        # Move forward
+        np.array([5., 5., 2., 0.]),        # Move right
+        np.array([0., 5., 2., 0.]),        # Move back
+        np.array([0., 0., 2., 0.]),        # Return to start
+        np.array([0., 0., 0., 0.])         # Land
+    ]
+    
+    sim = DroneSimulation()
+    sim.run_simulation(waypoints, simulation_time=25.0)
+    print(f"Simulation completed! Final battery: {sim.state.battery_level:.1f}%, Final position: {np.round(sim.state.position, 2)}")
+    sim.visualize_trajectory()
+
